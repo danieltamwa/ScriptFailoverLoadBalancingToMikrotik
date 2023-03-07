@@ -1,0 +1,266 @@
+# ------------------- header -------------------
+# Base script created by IMAGINE PLUS LTD
+# Script  version 1.0.1
+
+
+
+
+# Remplissez les passerelles d'interface WAN (adresse IP ou nom d'interface - l'adresse IP est recommandée, mais pour un nom d'interface WAN utilisé par un client dhcp)
+:local GatewayISP1 lte1
+:local GatewayISP2 192.168.100.1
+
+
+# Marquez les routes avec des commentaires et remplissez leurs marques (commentaires uniques seulement !!!)
+:local RouteISP1 [/ip route find comment="WAN1"];
+:local RouteISP2 [/ip route find comment="WAN2"];
+
+
+
+#Vérifiez les hôtes: opendns, googledns, 0.ntp.europe.pool (vous pouvez ajouter d'autres hôtes si nécessaire - mais n'oubliez pas de vérifier les règles de pare-feu et de les ajouter à la liste blanche si nécessaire)
+:local PingTargets {"8.8.8.8"}
+
+# La quantité de ping échoue pour déclarer la route comme défectueuse
+:local FailTreshold 15
+
+# Définir l'augmentation de distance d'un itinéraire en cas d'échec (le nombre doit être le nombre de FAI ou plus)
+:local DistanceIncrease 5
+
+# -------------- stop editing here --------------
+
+# Déclarer les variables globales
+:global PingFailCountISP1
+:global OriginalRouteDistanceISP1 1
+:global PingFailCountISP2
+:global OriginalRouteDistanceISP2 2
+:global PingFailCountLTE
+:global simSlot [/system routerboard modem get sim-slot]
+:global RtrName [/system identity get name]
+
+
+
+
+# Ceci initialise les variables PingFailCount, au cas où il s'agisse de la première exécution du script.
+:if ([:typeof $PingFailCountISP1] = "nothing") do={
+	:set PingFailCountISP1 0
+}
+:if ([:typeof $PingFailCountISP2] = "nothing") do={
+	:set PingFailCountISP2 0
+}
+:if ([:typeof $PingFailCountLTE] = "nothing") do={
+	:set PingFailCountLTE 0
+}
+
+
+
+# Cette variable sera utilisée pour conserver les résultats de tentatives de ping individuelles
+:local PingResult
+
+#Nettoyer la table de routage au cas où il resterait un itinéraire
+/ip route remove [find comment="FAILOVER CHECK ROUTE"]
+
+
+
+
+
+###########################################################################################
+# Vérifiez ISP1
+
+#Vérifiez chaqu'une des IP à distance (3 fois)
+:foreach k,pingTarget in=$PingTargets do={
+
+	:delay 1s;
+    /ip route remove [find dynamic=yes dst-address=0.0.0.0/0]
+	/ip route add comment="FAILOVER CHECK ROUTE" distance=1 gateway=$GatewayISP1 dst-address=$pingTarget
+	:local testRouteID [/ip route find comment="FAILOVER CHECK ROUTE"];
+	/log warning "ping de $pingTarget à travers $GatewayISP1"
+
+	:set PingResult [ping $pingTarget count=1];
+
+ 	:if ([/ip route get $testRouteID gateway-status] ~"unreachable"=true) do={
+
+		:set PingFailCountISP1 ($PingFailCountISP1 + 1)
+		:set PingFailCountLTE ($PingFailCountLTE + 1)
+		/log error "Ping vers $pingTarget à travers $GatewayISP1 a échoué - unreachable gw"
+
+ 	} else={
+
+		# remote ping failed, increase fail count isp +1
+		:if ($PingResult = 0) do={
+			:set PingFailCountISP1 ($PingFailCountISP1 + 1)
+			:set PingFailCountLTE ($PingFailCountLTE + 1)
+			/log error "Ping vers $pingTarget à travers $GatewayISP1 a échoué - échec ping"
+		};
+
+		# remote ping passed, decrease fail count isp -1
+		:if ($PingResult = 1) do={
+			:if ($PingFailCountISP1 > 0) do={
+				:set PingFailCountISP1 ($PingFailCountISP1 - 1)
+			};
+			:if ($PingFailCountLTE > 0) do={
+				:set PingFailCountLTE ($PingFailCountLTE - 1)
+			};
+		};
+
+ 	}
+	/ip route remove [find comment="FAILOVER CHECK ROUTE"]
+};
+
+#en cas d'échec de la requête ping vers seuil, déclarez la route comme étant défectueuse
+:if ($PingFailCountISP1 >= $FailTreshold) do={ 
+    :if ($PingFailCountISP1 >= 500) do={
+	    :set PingFailCountISP1  500
+    }
+	:if ($PingFailCountLTE >= 4000) do={
+	    :set PingFailCountLTE  4000
+    }
+	
+	:if ($OriginalRouteDistanceISP1 + $DistanceIncrease != [/ip route get $RouteISP1 distance]) do={
+		/log warning "ISP1 a un problème sur la route vers $pingTarget - augmentation de la distance de la route."
+		/ip route set $RouteISP1 distance=($OriginalRouteDistanceISP1 + $DistanceIncrease)
+		/log warning "Augmentation de la distance de route ISP1 terminée."
+	}
+	:if ($simSlot!="b") do={
+	    /log warning " etat du port lte va changer à : b"
+	    /tool e-mail send to="rh@imaginepls.com" subject=" probleme  sur $RtrName" body=" Changement de l etat du port de $RtrName a : b "
+	    /system routerboard modem set sim-slot=b;
+        :set PingFailCountISP1  0
+	    :set PingFailCountLTE  4000
+	    delay 60s;
+        /interface lte set lte1 apn-profiles="MTN CM";
+	 };  
+}
+
+:if ($PingFailCountISP1 < $FailTreshold) do={
+
+	/log warning "ISP1 fonctionne bien"
+
+	:if ([/ip route get $RouteISP1 distance] != $OriginalRouteDistanceISP1) do={
+
+		/log warning "ISP1 peut atteindre $pingTarget à nouveau, en ramenant la distance initiale de la route."
+
+		# si ISP1RecoverSpeed est "rapide" - la récupération du fournisseur de services Internet sera plus rapide - mais il existe un risque potentiel de battement en route (si son fournisseur de services est instable)
+		#
+		# si ISP1RecoverSpeed est "lent" - la récupération de votre fournisseur d'accès sera plus lente - mais nous sommes en sécurité en cas d'instabilité du fournisseur d'accès
+		:local ISP1RecoverSpeed "slow";
+
+		:if ($ISP1RecoverSpeed = "slow") do={
+			/log warning "La récupération du ISP1 est réglée sur SLOW"
+			:for pingRun from 0 to 1 do={
+				:if ($PingFailCountISP1 > 0) do={
+					:set PingFailCountISP1 ($PingFailCountISP1 - 1)
+					:set PingFailCountLTE ($PingFailCountLTE - 1)
+				}
+			}
+		} else={
+			/log warning "La récupération du ISP1 est réglée sur FAST"
+			:set PingFailCountISP1 0
+		}
+
+		:if ($PingFailCountISP1 <= 2) do={
+			
+			/ip route set $RouteISP1 distance=($OriginalRouteDistanceISP1)
+			/log warning "La distance de la route vers ISP1 est renvoyée à sa valeur initiale."
+		}
+	}
+	:if ($PingFailCountLTE < 10) do={
+		:if ($simSlot!="a") do={
+			/log warning " etat du port lte va changer à : a"
+			/tool e-mail send to="rh@imaginepls.com" subject=" Retablissement de la liaison  sur $RtrName" body=" Retablissement de l etat du port de $RtrName a : a "
+			/system routerboard modem set sim-slot=a;
+			:set PingFailCountISP1  0
+			delay 60s;
+			/interface lte set lte1 apn-profiles="orange";
+		};
+	};  
+	
+	
+}
+
+###########################################################################################
+# Vérifiez ISP2
+
+# Vérifiez chaqu'une des IP à distance (3 fois)
+:foreach k,pingTarget in=$PingTargets do={
+
+	:delay 1s;
+	/ip route add comment="FAILOVER CHECK ROUTE" distance=1 gateway=$GatewayISP2 dst-address=$pingTarget
+	:local testRouteID [/ip route find comment="FAILOVER CHECK ROUTE"];
+	/log warning "ping de $pingTarget à travers $GatewayISP2"
+
+	:set PingResult [ping $pingTarget count=1];
+
+ 	:if ([/ip route get $testRouteID gateway-status] ~"unreachable"=true) do={
+
+		:set PingFailCountISP2 ($PingFailCountISP2 + 1)
+		/log error "Ping de $pingTarget à travers $GatewayISP2 FAILED - unreachable gw"
+
+ 	} else={
+
+		# remote ping failed, increase fail count isp +1
+		:if ($PingResult = 0) do={
+			:set PingFailCountISP2 ($PingFailCountISP2 + 1)
+			/log error "Ping de $pingTarget à travers $GatewayISP2 à échoué - échec ping"
+		};
+
+		# remote ping passed, decrease fail count isp -1
+		:if ($PingResult = 1) do={
+			:if ($PingFailCountISP2 > 0) do={
+				:set PingFailCountISP2 ($PingFailCountISP2 - 1)
+			};
+		};
+
+ 	}
+
+	/ip route remove [find comment="FAILOVER CHECK ROUTE"]
+};
+
+#en cas d'échec de la requête ping vers seuil, déclarez la route comme étant défectueuse
+:if ($PingFailCountISP2 >= $FailTreshold) do={
+
+    :if ($PingFailCountISP2 >= 2000) do={
+	    :set PingFailCountISP2  2000
+    }
+
+	
+	:if ($OriginalRouteDistanceISP2 + $DistanceIncrease != [/ip route get $RouteISP2 distance]) do={
+
+		/log warning "ISP2 a un problème sur la route vers $pingTarget - augmentation de la distance de la route."
+		/ip route set $RouteISP2 distance=($OriginalRouteDistanceISP2 + $DistanceIncrease)
+		/log warning "Augmentation de la distance de route ISP2 terminée."
+	}
+}
+
+:if ($PingFailCountISP2 < $FailTreshold) do={
+
+	/log warning "ISP2 fonctionne bien"
+
+	:if ([/ip route get $RouteISP2 distance] != $OriginalRouteDistanceISP2) do={
+
+		/log warning "ISP2 peut atteindre $pingTarget à nouveau, en ramenant la distance initiale de la route."
+
+		
+		# si ISP2RecoverSpeed est "rapide" - la récupération du fournisseur de services Internet sera plus rapide - mais il existe un risque potentiel de battement en route (si son fournisseur de services est instable)
+		#
+		# si ISP2RecoverSpeed est "lent" - la récupération de votre fournisseur d'accès sera plus lente - mais nous sommes en sécurité en cas d'instabilité du fournisseur d'accès
+		:local ISP2RecoverSpeed "slow";
+
+		:if ($ISP2RecoverSpeed = "slow") do={
+			/log warning "La récupération du ISP2 est réglée sur SLOW"
+			:for pingRun from 0 to 1 do={
+				:if ($PingFailCountISP2 > 0) do={
+					:set PingFailCountISP2 ($PingFailCountISP2 - 1)
+				}
+			}
+		} else={
+			/log warning "La récupération du ISP2 est réglée sur FAST"
+			:set PingFailCountISP2 0
+		}
+
+		:if ($PingFailCountISP2 <= 1) do={
+			
+			/ip route set $RouteISP2 distance=($OriginalRouteDistanceISP2)
+			/log warning "La distance de la route vers ISP2 est renvoyée à sa valeur initiale."
+		}
+	}
+	
+}
